@@ -1,0 +1,81 @@
+# 每周一 12:00（Asia/Shanghai）自动发送"上周 GitHub 最热 skill"周报
+#
+# 投递方式（按需配置，缺省时不发）：
+#   1) GitHub Issue  —— 默认就开：自动在仓库里建一个 Issue 并指派给仓库 owner，
+#                      GitHub 会通过邮件 / App 通知你。只用内置 GITHUB_TOKEN，无需配置。
+#   2) WEBHOOK_URL   —— 选填。Discord / Slack / 飞书 等机器人的 webhook 地址。
+#   3) TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID —— 选填。Telegram 推送。
+#
+# 时间说明：cron 用 UTC，04:00 UTC = 12:00 北京时间（中国无夏令时，全年固定）。
+#
+# 保活：GitHub 对 60 天没有任何提交的仓库会自动停用 schedule 工作流。
+# 下面 keepalive 这个 job 每周把当天日期写进仓库根目录的 .keep 并提交一次，
+# 让仓库始终保持"有活动"状态，定时任务就不会被停。
+
+name: Weekly Skill Report
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: weekly-skill-report
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    name: 保活（写日期并提交 .keep）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 写入当天日期
+        run: |
+          set -euo pipefail
+          echo "$(TZ=Asia/Shanghai date +%F)" > .keep
+          echo "写入 .keep：$(cat .keep)"
+
+      - name: 提交并推送
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -z "$(git status --porcelain -- .keep)" ]; then
+            echo "本轮已提交过 $(cat .keep)，无需重复提交"
+            exit 0
+          fi
+
+          git add .keep
+          git commit -m "chore: keep-alive $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+  report:
+    name: 生成并发送周报
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 生成周报并投递
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPORT_ISSUE_ASSIGNEE: ${{ github.repository_owner }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/weekly_skill_report.py

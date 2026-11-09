@@ -1,0 +1,177 @@
+# 自动发布 + 自动部署
+#
+# 触发方式：
+#   1) 推送 v* 标签（例如：git tag v1.0.0 && git push origin v1.0.0）
+#   2) 手动运行（Actions 页面 Run workflow，填写版本号）
+#
+# 流程：打包源码 → 创建/更新 GitHub Release → （可选）部署到服务器
+#
+# 只有配置了下面这些 Secrets 才会执行部署，否则 deploy job 自动跳过：
+#   DEPLOY_HOST     服务器地址，例如 1.2.3.4 或 example.com
+#   DEPLOY_USER     SSH 用户名，例如 deploy
+#   DEPLOY_SSH_KEY  部署私钥（ssh-keygen -t ed25519 -f deploy_key，公钥写进服务器 ~/.ssh/authorized_keys）
+#   DEPLOY_PATH     服务器上的发布目录，例如 /var/www/myapp（路径中不要带空格）
+#   DEPLOY_PORT     SSH 端口，可选，默认 22
+#   DEPLOY_CMD      解包后执行的命令，可选，例如 systemctl restart myapp
+
+name: Release & Deploy
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（例如 v1.0.0）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 打包
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      archive: ${{ steps.pack.outputs.archive }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 计算版本号
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^v?[0-9]+(\.[0-9]+){0,3}([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::版本号格式不正确：$VERSION（应形如 v1.0.0）"
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "版本号：$VERSION"
+
+      - name: 安装并构建（存在 package.json 时）
+        if: ${{ hashFiles('package.json') != '' }}
+        run: |
+          set -euo pipefail
+          npm ci || npm install
+          npm run build --if-present
+
+      - name: 打包源码
+        id: pack
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          NAME="$(basename "$GITHUB_REPOSITORY")-${VERSION}"
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="${NAME}/" -o "dist/${NAME}.tar.gz" HEAD
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          ls -lh dist
+          echo "archive=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: 上传临时产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-archive
+          path: dist/*
+          retention-days: 7
+
+  release:
+    name: 发布 Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载打包产物
+        uses: actions/download-artifact@v4
+        with:
+          name: release-archive
+          path: dist
+
+      - name: 创建或更新 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.version }}
+          name: ${{ needs.build.outputs.version }}
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(needs.build.outputs.version, '-') }}
+          fail_on_unmatched_files: true
+
+  deploy:
+    name: 部署到服务器
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+      DEPLOY_CMD: ${{ secrets.DEPLOY_CMD }}
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: 检查部署配置
+        id: check
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          if [ -n "${DEPLOY_HOST}" ] && [ -n "${DEPLOY_USER}" ] && [ -n "${DEPLOY_PATH}" ] && [ -n "${DEPLOY_SSH_KEY}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未完整配置 DEPLOY_HOST / DEPLOY_USER / DEPLOY_PATH / DEPLOY_SSH_KEY，跳过部署"
+          fi
+
+      - name: 下载打包产物
+        if: steps.check.outputs.enabled == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: release-archive
+          path: dist
+
+      - name: 加载部署私钥
+        if: steps.check.outputs.enabled == 'true'
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: 记录主机指纹
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${DEPLOY_PORT:-22}" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: 上传并解包
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          PORT="${DEPLOY_PORT:-22}"
+          REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
+          TARGET="${DEPLOY_PATH}/releases/${VERSION}"
+          ssh -p "$PORT" -o StrictHostKeyChecking=yes "$REMOTE" "mkdir -p '$TARGET'"
+          rsync -az --info=progress2 -e "ssh -p $PORT -o StrictHostKeyChecking=yes" dist/*.tar.gz "$REMOTE:$TARGET/"
+          ssh -p "$PORT" -o StrictHostKeyChecking=yes "$REMOTE" "cd '$TARGET' && tar -xzf ./*.tar.gz --strip-components=1"
+          if [ -n "${DEPLOY_CMD}" ]; then
+            ssh -p "$PORT" -o StrictHostKeyChecking=yes "$REMOTE" "$DEPLOY_CMD"
+          fi
+          echo "::notice::已部署 $VERSION 到 $TARGET"

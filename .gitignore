@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.tmp/
+report*.md
+weekly-report.md
+scripts/.translate-cache.json
